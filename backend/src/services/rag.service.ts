@@ -2,83 +2,164 @@ import { embedMany, generateText } from 'ai';
 import { getEmbeddingModel, getChatModel } from '../lib/ai.js';
 import { vectorStore } from '../lib/vector-store.js';
 import { v4 as uuid } from 'uuid';
+import fs from 'fs';
+import path from 'path';
+import { chunk } from 'llm-chunk';
 
+// Define the chunk shape for clarity
 type IngestDoc = {
   id?: string;
   text: string;
   metadata?: Record<string, any>;
 };
 
-export async function ingestDocuments(docs: IngestDoc[]) {
-  // Prepare values for embeddings
-  const values = docs.map(d => d.text);
-  const embeddingModel = getEmbeddingModel();
+type TextChunk = {
+  text: string;
+  chunkIndex: number;
+  totalChunks: number;
+  startChar: number;
+  endChar: number;
+};
 
-  const { embeddings } = await embedMany({
-    model: embeddingModel,
-    values
+function chunkText(text: string, maxTokens = 7000, overlap = 200): TextChunk[] {
+  const avgCharsPerToken = 4;
+  const maxChars = maxTokens * avgCharsPerToken;
+  const overlapChars = overlap * avgCharsPerToken;
+  text = text.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n');
+
+  const chunks = chunk(text, {
+    minLength: 0,
+    maxLength: maxChars,
+    splitter: 'paragraph',
+    overlap: overlapChars,
+    delimiters: '\n\n'
   });
 
-  const stored = docs.map((doc, i) => ({
-    id: doc.id ?? uuid(),
-    text: doc.text,
-    metadata: doc.metadata ?? {},
-    embedding: embeddings[i]!
+  return chunks.map((chunkText, index) => {
+    let startChar = 0;
+    for (let i = 0; i < index; i++) {
+      startChar += chunks[i].length - overlapChars;
+    }
+    startChar = Math.max(0, startChar);
+    const endChar = Math.min(startChar + chunkText.length, text.length);
+
+    return {
+      text: chunkText,
+      chunkIndex: index,
+      totalChunks: chunks.length,
+      startChar,
+      endChar
+    };
+  });
+}
+
+export async function ingestFromFile(filePath = 'public/input.txt') {
+  const fullPath = path.resolve(process.cwd(), filePath);
+  if (!fs.existsSync(fullPath)) {
+    throw new Error(`File not found: ${fullPath}`);
+  }
+
+  const content = fs.readFileSync(fullPath, 'utf-8');
+  const filename = path.basename(fullPath);
+  console.log(`Loaded ${filename} (${content.length} characters)`);
+
+  const chunks = chunkText(content);
+  console.log(`Split into ${chunks.length} chunks`);
+
+  const allChunks = chunks.map(chunkItem => ({
+    id: uuid(),
+    text: chunkItem.text,
+    metadata: {
+      filename,
+      ...chunkItem,
+      type: 'file_chunk',
+      originalSize: content.length,
+      processedAt: new Date().toISOString()
+    }
   }));
 
-  vectorStore.addDocuments(stored);
+  const batchSize = 100;
+  let results: Array<any> = [];
+
+  for (let i = 0; i < allChunks.length; i += batchSize) {
+    const batch = allChunks.slice(i, i + batchSize);
+    const values = batch.map(c => c.text);
+    for (const c of values) {
+      if (c.length / 4 > 8192) {
+        throw new Error(`Chunk too large for embedding: ~${Math.floor(c.length / 4)} tokens`);
+      }
+    }
+    console.log(`Embedding batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(allChunks.length / batchSize)}`);
+    const { embeddings } = await embedMany({
+      model: getEmbeddingModel(),
+      values
+    });
+
+    const stored = batch.map((chunkEntry, idx) => ({
+      id: chunkEntry.id,
+      text: chunkEntry.text,
+      metadata: chunkEntry.metadata,
+      embedding: embeddings[idx]
+    }));
+
+    vectorStore.addDocuments(stored);
+    results = results.concat(stored);
+
+    // pause if more batches remain
+    if (i + batchSize < allChunks.length) {
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
 
   return {
-    ingested: stored.length,
+    success: true,
+    ingested: results.length,
     totalDocuments: vectorStore.count(),
-    ids: stored.map(d => d.id)
+    filename,
+    chunks: allChunks.length,
+    originalSize: content.length
   };
 }
 
-export async function answerQuery(query: string, topK: number) {
-  // Embed the user query
-  const embeddingModel = getEmbeddingModel();
+export async function answerQuery(query: string, topK = 5) {
   const { embeddings } = await embedMany({
-    model: embeddingModel,
+    model: getEmbeddingModel(),
     values: [query]
   });
-  const queryEmbedding = embeddings[0]!;
+  const queryEmbedding = embeddings[0];
 
-  // Retrieve topK similar docs
   const results = vectorStore.similaritySearch(queryEmbedding, topK);
-  const contextBlocks = results.map((r, idx) => {
-    const sourceTag = r.doc.metadata?.source ?? r.doc.id;
-    return `[${idx + 1}] (source: ${sourceTag})\n${r.doc.text}`;
+  const context = results.map((r, idx) => {
+    const meta = r.doc.metadata || {};
+    const info = meta.chunkIndex !== undefined
+      ? ` (chunk ${meta.chunkIndex + 1}/${meta.totalChunks})`
+      : '';
+    return `[${idx + 1}] source: ${meta.filename || r.doc.id}${info}\n${r.doc.text}`;
   });
 
   const systemPrompt = `
-You are a retrieval-augmented assistant. Use ONLY the provided context blocks to answer the user's question.
-- If the answer isn't in the context, say you don't have enough information.
-- Cite sources inline using [n] where n matches the context block number.
-- Keep answers concise and factual.
-`;
+You are Sonic, a brand-specific AI agent. Use the following context to answer questions accurately. If information is not in context, say so clearly.
 
-  const userPrompt = `Question: ${query}
+CONTEXT:
+${context.join('\n\n')}`;
 
-Context:
-${contextBlocks.join('\n\n')}
-
-Answer with citations like [1], [2], etc.`;
-
-  // Generate a non-streaming answer
   const { text } = await generateText({
     model: getChatModel(),
     system: systemPrompt.trim(),
-    prompt: userPrompt
+    prompt: query.trim()
   });
+
+  const retrievedChunks = results.map((r, idx) => ({
+    index: idx + 1,
+    id: r.doc.id,
+    score: r.score,
+    metadata: r.doc.metadata,
+    text: r.doc.text
+  }));
 
   return {
     answer: text,
-    sources: results.map((r, idx) => ({
-      index: idx + 1,
-      id: r.doc.id,
-      score: r.score,
-      metadata: r.doc.metadata ?? {}
-    }))
+    retrievedChunks,
+    sources: retrievedChunks.map(({ index, id, score, metadata }) => ({ index, id, score, metadata }))
   };
 }

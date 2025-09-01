@@ -19,8 +19,7 @@ const queryBodySchema = z.object({
 
 export async function ingest(req: Request, res: Response, next: NextFunction) {
   try {
-    const parsed = ingestBodySchema.parse(req.body);
-    const result = await RagService.ingestDocuments(parsed.docs);
+    const result = await RagService.ingestFromFile();
     res.status(201).json(result);
   } catch (err) {
     next(err);
